@@ -1,46 +1,97 @@
 # main.py
+# --- PORTABLE BOOTSTRAP (Must be before ANY other imports) ---
 import sys
+import os
+import ctypes.util
+
+if getattr(sys, 'frozen', False):
+    # Мы внутри собранного PyInstaller бинарника
+    # sys._MEIPASS — временная папка, куда PyInstaller распаковал ресурсы
+    base_path = sys._MEIPASS
+    
+    # Структура внутри бинарника, которую создаст build.py:
+    # _MEIPASS/vlc_libs/          -> libvlc.so, libvlccore.so, vlc.dll, plugins/
+    # _MEIPASS/vlc_libs/plugins/  -> ВАЖНО: без папки plugins VLC не играет форматы
+    vlc_lib_dir = os.path.join(base_path, 'vlc_libs')
+    vlc_plugin_dir = os.path.join(vlc_lib_dir, 'plugins')
+
+    # 1. Настраиваем пути поиска библиотек ОС
+    if sys.platform == 'win32':
+        # Windows: добавляем папку с DLL в PATH и используем add_dll_directory (Python 3.8+)
+        os.environ['PATH'] = vlc_lib_dir + os.pathsep + os.environ.get('PATH', '')
+        if hasattr(os, 'add_dll_directory'):
+            try: os.add_dll_directory(vlc_lib_dir)
+            except Exception: pass
+    else:
+        # Linux / macOS: LD_LIBRARY_PATH / DYLD_LIBRARY_PATH
+        os.environ['LD_LIBRARY_PATH'] = vlc_lib_dir + os.pathsep + os.environ.get('LD_LIBRARY_PATH', '')
+        if sys.platform == 'darwin':
+            os.environ['DYLD_LIBRARY_PATH'] = vlc_lib_dir + os.pathsep + os.environ.get('DYLD_LIBRARY_PATH', '')
+
+    # 2. Явно указываем VLC, где лежат плагины (декодеры, демуксеры, видео-вывод)
+    # Это КРИТИЧЕСКИ ВАЖНО. Без этого VLC инициализируется, но media_new вернет ошибку "No suitable decoder module".
+    os.environ['VLC_PLUGIN_PATH'] = vlc_plugin_dir
+
+    # 3. Монки-патчим ctypes.util.find_library, который использует python-vlc для поиска libvlc
+    _original_find_library = ctypes.util.find_library
+    def _patched_find_library(name: str):
+        # python-vlc ищет 'vlc' и 'vlccore'
+        if name in ('vlc', 'vlccore'):
+            # Формируем имя файла под платформу
+            if sys.platform == 'win32':
+                lib_name = f'{name}.dll'
+            elif sys.platform == 'darwin':
+                lib_name = f'lib{name}.dylib'
+            else: # linux, bsd
+                lib_name = f'lib{name}.so'
+            
+            candidate = os.path.join(vlc_lib_dir, lib_name)
+            if os.path.exists(candidate):
+                return candidate
+        return _original_find_library(name)
+    
+    ctypes.util.find_library = _patched_find_library
+
+# --- END BOOTSTRAP ---
+
 import platform
-import vlc
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QFileDialog, QStyle, QLabel, QTextEdit,
     QDockWidget, QMessageBox
 )
-from PyQt5.QtCore import Qt, QTimer, QUrl
-from PyQt5.QtGui import QIcon, Font, QFontDatabase
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFontDatabase
+
+# Теперь импорт vlc безопасен — он найдет наши библиотеки
+import vlc
+
 
 class MediaPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VLC Python Player")
+        self.setWindowTitle("Portable VLC Player")
         self.resize(1000, 600)
 
-        # --- VLC Core ---
-        # Аргументы: --no-xlib критически важен для Linux + Qt (избегает дедлоков X11)
+        # VLC Instance: --no-xlib критичен для Linux+Qt
+        # --quiet убирает спам в консоль
         self.instance = vlc.Instance("--no-xlib", "--quiet")
         self.player = self.instance.media_player_new()
         self.media = None
 
-        # --- UI Setup ---
         self._setup_ui()
         self._setup_vlc_video_output()
         
-        # Таймер для обновления слайдера времени (100мс)
         self.timer = QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self._update_ui_timer)
-        
-        # Флаг, чтобы не дергать setPosition при ручном движении слайдера
         self._slider_pressed = False
 
     def _setup_ui(self):
-        # 1. Видео-виджет (черный фон)
         self.video_widget = QWidget()
-        self.video_widget.setStyleSheet("background-color: black;")
+        self.video_widget.setStyleSheet("background-color: #1a1a1a;")
         self.video_widget.setMinimumSize(640, 360)
 
-        # 2. Контролы
         self.btn_open = QPushButton("Открыть файл")
         self.btn_open.clicked.connect(self.open_file)
         self.btn_open.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
@@ -66,7 +117,6 @@ class MediaPlayer(QMainWindow):
         controls_layout.addWidget(self.slider_time, 1)
         controls_layout.addWidget(self.lbl_time)
 
-        # 3. Центральный виджет
         central_layout = QVBoxLayout()
         central_layout.addWidget(self.video_widget, 1)
         central_layout.addLayout(controls_layout)
@@ -75,7 +125,7 @@ class MediaPlayer(QMainWindow):
         central_widget.setLayout(central_layout)
         self.setCentralWidget(central_widget)
 
-        # 4. Док-виджет "Информация о медиафайле"
+        # Dock: Media Info
         self.info_text = QTextEdit()
         self.info_text.setReadOnly(True)
         self.info_text.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
@@ -85,42 +135,34 @@ class MediaPlayer(QMainWindow):
         dock.setWidget(self.info_text)
         dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
-        
-        # Скрываем док по умолчанию, покажем при загрузке файла
         dock.hide()
         self.dock_info = dock
 
     def _setup_vlc_video_output(self):
-        """Кроссплатформенная привязка окна вывода видео к VLC."""
         win_id = int(self.video_widget.winId())
         sys_name = platform.system()
-        
         try:
-            if sys_name == "Linux":      # X11 / Wayland (через XWayland)
+            if sys_name == "Linux":
                 self.player.set_xwindow(win_id)
             elif sys_name == "Windows":
                 self.player.set_hwnd(win_id)
-            elif sys_name == "Darwin":   # macOS (Cocoa)
+            elif sys_name == "Darwin":
                 self.player.set_nsobject(win_id)
-            else:
-                print(f"Warning: Unknown platform {sys_name}, video may not render.")
         except Exception as e:
             QMessageBox.critical(self, "VLC Video Error", f"Failed to bind video window:\n{e}")
 
-    # --- File Handling ---
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Открыть медиафайл", "", 
-            "Media Files (*.mp4 *.mkv *.avi *.mov *.flv *.mp3 *.flac *.wav *.opus *.webm);;All Files (*)"
+            "Media Files (*.mp4 *.mkv *.avi *.mov *.flv *.mp3 *.flac *.wav *.opus *.webm *.ts *.m4v);;All Files (*)"
         )
-        if not path:
-            return
+        if not path: return
 
         self._reset_state()
         self.media = self.instance.media_new(path)
         self.player.set_media(self.media)
         
-        # Парсим медиа синхронно, чтобы получить треки до старта (опционально, но надежнее)
+        # Парсим метаданные синхронно
         self.media.parse() 
         
         self._populate_media_info()
@@ -141,35 +183,24 @@ class MediaPlayer(QMainWindow):
             self.media.release()
             self.media = None
 
-    # --- Playback Control ---
     def toggle_play(self):
-        if not self.media:
-            return
-        if self.player.is_playing():
-            self.player.pause()
-        else:
-            self.player.play()
+        if not self.media: return
+        if self.player.is_playing(): self.player.pause()
+        else: self.player.play()
         self._update_play_button_icon()
 
     def _update_play_button_icon(self):
         icon = QStyle.SP_MediaPause if self.player.is_playing() else QStyle.SP_MediaPlay
         self.btn_play.setIcon(self.style().standardIcon(icon))
 
-    # --- Slider & Timer ---
     def _update_ui_timer(self):
-        if not self.media or self._slider_pressed:
-            return
-        
-        length = self.player.get_length()  # ms
-        time = self.player.get_time()      # ms
-        
+        if not self.media or self._slider_pressed: return
+        length = self.player.get_length()
+        time = self.player.get_time()
         if length > 0:
             self.slider_time.setRange(0, length)
             self.slider_time.setValue(time)
-        
         self.lbl_time.setText(f"{self._fmt_time(time)} / {self._fmt_time(length)}")
-        
-        # Автостоп в конце (VLC иногда не ставит paused state сразу)
         if time >= length > 0 and not self.player.is_playing():
             self.timer.stop()
             self._update_play_button_icon()
@@ -190,98 +221,52 @@ class MediaPlayer(QMainWindow):
         m, s = divmod(r, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    # --- Media Info Parsing (The Core Logic) ---
     def _populate_media_info(self):
-        if not self.media:
-            return
-
+        if not self.media: return
         lines = []
         meta = self.media
         
-        # 1. General Metadata (Title, Artist, etc.)
         lines.append("=== GENERAL METADATA ===")
         meta_map = {
-            vlc.Meta.Title: "Title",
-            vlc.Meta.Artist: "Artist",
-            vlc.Meta.Genre: "Genre",
-            vlc.Meta.Copyright: "Copyright",
-            vlc.Meta.Album: "Album",
-            vlc.Meta.TrackNumber: "Track #",
-            vlc.Meta.Description: "Description",
-            vlc.Meta.Date: "Date",
-            vlc.Meta.Setting: "Setting",
-            vlc.Meta.URL: "URL",
-            vlc.Meta.Language: "Language",
-            vlc.Meta.NowPlaying: "Now Playing",
-            vlc.Meta.Publisher: "Publisher",
-            vlc.Meta.EncodedBy: "Encoded By",
-            vlc.Meta.ArtworkURL: "Artwork URL",
-            vlc.Meta.TrackID: "Track ID",
+            vlc.Meta.Title: "Title", vlc.Meta.Artist: "Artist", vlc.Meta.Genre: "Genre",
+            vlc.Meta.Copyright: "Copyright", vlc.Meta.Album: "Album", vlc.Meta.TrackNumber: "Track #",
+            vlc.Meta.Description: "Description", vlc.Meta.Date: "Date", vlc.Meta.URL: "URL",
+            vlc.Meta.Language: "Language", vlc.Meta.Publisher: "Publisher", vlc.Meta.EncodedBy: "Encoded By",
         }
         for key, label in meta_map.items():
             val = meta.get_meta(key)
-            if val:
-                lines.append(f"{label:15}: {val}")
+            if val: lines.append(f"{label:15}: {val}")
         
-        # Duration from meta (sometimes more accurate) or player
-        duration_ms = meta.get_duration()
-        if duration_ms > 0:
-            lines.append(f"{'Duration':15}: {self._fmt_time(duration_ms)} ({duration_ms} ms)")
+        dur = meta.get_duration()
+        if dur > 0: lines.append(f"{'Duration':15}: {self._fmt_time(dur)} ({dur} ms)")
 
-        lines.append("\n=== TRACKS INFO (get_tracks_info) ===")
-        
-        # 2. Deep Track Info (Codecs, Resolution, Bitrate, FPS)
-        # get_tracks_info() возвращает список словарей. Требует libvlc >= 3.0
-        tracks = meta.tracks_get() # Deprecated name in some bindings, usually media.get_tracks_info() or media.tracks_get()
-        # python-vlc использует media.get_tracks_info() или media.tracks_get()
-        # Проверим оба варианта для совместимости
+        lines.append("\n=== TRACKS INFO ===")
         tracks_info = []
-        if hasattr(meta, 'get_tracks_info'):
-            tracks_info = meta.get_tracks_info()
-        elif hasattr(meta, 'tracks_get'):
-            tracks_info = meta.tracks_get()
+        if hasattr(meta, 'get_tracks_info'): tracks_info = meta.get_tracks_info()
+        elif hasattr(meta, 'tracks_get'): tracks_info = meta.tracks_get()
         
         if not tracks_info:
-            lines.append("No track info available (libvlc < 3.0 or parse failed).")
+            lines.append("No track info (libvlc < 3.0 or parse failed).")
         else:
-            for i, track in enumerate(tracks_info):
+            for i, t in enumerate(tracks_info):
                 lines.append(f"\n--- Track #{i} ---")
-                # Общие поля
-                t_type = track.get('type', 'unknown')
+                t_type = t.get('type', 'unknown')
                 lines.append(f"{'Type':15}: {t_type}")
-                lines.append(f"{'Codec (FourCC)':15}: {track.get('codec', 'N/A')}")
-                lines.append(f"{'Codec Name':15}: {track.get('codec_name', 'N/A')}")
-                lines.append(f"{'Language':15}: {track.get('language', 'N/A')}")
-                lines.append(f"{'Bitrate':15}: {self._fmt_bitrate(track.get('bitrate', 0))}")
-                lines.append(f"{'ID':15}: {track.get('id', 'N/A')}")
+                lines.append(f"{'Codec (FourCC)':15}: {t.get('codec', 'N/A')}")
+                lines.append(f"{'Codec Name':15}: {t.get('codec_name', 'N/A')}")
+                lines.append(f"{'Language':15}: {t.get('language', 'N/A')}")
+                lines.append(f"{'Bitrate':15}: {self._fmt_bitrate(t.get('bitrate', 0))}")
+                lines.append(f"{'ID':15}: {t.get('id', 'N/A')}")
 
                 if t_type == 'video':
-                    lines.append(f"{'Resolution':15}: {track.get('width', 0)}x{track.get('height', 0)}")
-                    # FPS приходит как числитель/знаменатель
-                    num = track.get('frame_rate_num', 0)
-                    den = track.get('frame_rate_den', 1)
-                    if num and den:
-                        fps = num / den
-                        lines.append(f"{'Frame Rate':15}: {fps:.3f} FPS ({num}/{den})")
-                    else:
-                        lines.append(f"{'Frame Rate':15}: N/A")
-                    
-                    # Доп. видео параметры
-                    if 'sar_num' in track and 'sar_den' in track:
-                        lines.append(f"{'SAR':15}: {track['sar_num']}/{track['sar_den']}")
-                
+                    lines.append(f"{'Resolution':15}: {t.get('width', 0)}x{t.get('height', 0)}")
+                    num, den = t.get('frame_rate_num', 0), t.get('frame_rate_den', 1)
+                    if num and den: lines.append(f"{'Frame Rate':15}: {num/den:.3f} FPS ({num}/{den})")
                 elif t_type == 'audio':
-                    lines.append(f"{'Sample Rate':15}: {track.get('rate', 0)} Hz")
-                    lines.append(f"{'Channels':15}: {track.get('channels', 0)}")
-                    # Bits per sample (глубина)
-                    if 'block_align' in track: # иногда есть
-                        pass 
-                
-                elif t_type == 'subpicture' or t_type == 'subtitle':
-                    lines.append(f"{'Encoding':15}: {track.get('encoding', 'N/A')}")
+                    lines.append(f"{'Sample Rate':15}: {t.get('rate', 0)} Hz")
+                    lines.append(f"{'Channels':15}: {t.get('channels', 0)}")
 
         self.info_text.setPlainText("\n".join(lines))
-        # Скролл в начало
         self.info_text.moveCursor(self.info_text.textCursor().Start)
 
     @staticmethod
@@ -293,22 +278,16 @@ class MediaPlayer(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
-        if self.player:
-            self.player.stop()
-            self.player.release()
-        if self.instance:
-            self.instance.release()
+        if self.player: self.player.stop(); self.player.release()
+        if self.instance: self.instance.release()
         super().closeEvent(event)
 
 
 def main():
-    # High DPI Support
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
     app = QApplication(sys.argv)
-    app.setStyle("Fusion") # Единый вид на всех ОС
-    
+    app.setStyle("Fusion")
     player = MediaPlayer()
     player.show()
     sys.exit(app.exec_())
