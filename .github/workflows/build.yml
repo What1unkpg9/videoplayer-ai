@@ -19,65 +19,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # --- LINUX ---
-          - os: ubuntu-latest
-            artifact_name: vlc-player-linux
-            ext: ""
-            sep: ":"
-            # Устанавливаем VLC из репозитория Ubuntu (гарантированно x86_64-linux-gnu)
-            setup_vlc: |
-              sudo apt-get update && sudo apt-get install -y vlc
-              mkdir -p vlc_libs/plugins
-              # Копируем ВСЕ версии .so* (libvlc.so.5, libvlc.so.5.6.0 и т.д.)
-              cp /usr/lib/x86_64-linux-gnu/libvlc.so* /usr/lib/x86_64-linux-gnu/libvlccore.so* vlc_libs/
-              # Создаем симлинки БЕЗ версии (libvlc.so -> libvlc.so.5), которых ждет bootstrap
-              cd vlc_libs
-              ln -sf libvlc.so.* libvlc.so
-              ln -sf libvlccore.so.* libvlccore.so
-              cd ..
-              # Копируем плагины рекурсивно
-              cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins vlc_libs/
-              ls -la vlc_libs/
-
-          # --- WINDOWS ---
-          - os: windows-latest
-            artifact_name: vlc-player-windows
-            ext: ".exe"
-            sep: ";"
-            # Скачиваем ПОРТАТИВНЫЙ ZIP официального релиза (без Chocolatey/инсталлеров)
-            # Версия 3.0.21 — последняя стабильная LTS на момент написания
-            setup_vlc: |
-              $VLC_VERSION = "3.0.21"
-              $ZIP_URL = "https://get.videolan.org/vlc/$VLC_VERSION/win64/vlc-$VLC_VERSION-win64.zip"
-              Write-Host "Downloading $ZIP_URL ..."
-              Invoke-WebRequest -Uri $ZIP_URL -OutFile "vlc.zip" -UseBasicParsing
-              # 7z встроен в windows-latest
-              7z x vlc.zip -ovlc_portable > nul
-              $SRC = Get-ChildItem -Directory vlc_portable\vlc-* | Select-Object -First 1
-              mkdir vlc_libs\plugins -Force
-              Copy-Item "$SRC\libvlc.dll" vlc_libs\
-              Copy-Item "$SRC\libvlccore.dll" vlc_libs\
-              Copy-Item "$SRC\plugins\*" vlc_libs\plugins\ -Recurse -Force
-              Write-Host "VLC libs prepared:"
-              ls vlc_libs\
-
-          # --- MACOS ---
-          - os: macos-latest
-            artifact_name: vlc-player-macos
-            ext: ""
-            sep: ":"
-            # Ставим VLC через Homebrew (Formula, keg-only). Быстрее и детерминированнее Cask.
-            setup_vlc: |
-              brew install vlc
-              VLC_PREFIX=$(brew --prefix vlc)
-              mkdir -p vlc_libs/plugins
-              # Формула кладет .dylib в $PREFIX/lib, плагины в $PREFIX/lib/vlc/plugins
-              cp "$VLC_PREFIX/lib/libvlc.dylib" "$VLC_PREFIX/lib/libvlccore.dylib" vlc_libs/
-              cp -r "$VLC_PREFIX/lib/vlc/plugins" vlc_libs/
-              ls -la vlc_libs/
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
+      # --- COMMON ---
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -85,84 +30,191 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          # Кэш убран намеренно — нет requirements.txt
 
-      # --- ШАГ 1: Подготовка VLC для Windows (PowerShell) ---
-      - name: Prepare VLC Libraries (Windows)
-        if: matrix.os == 'windows-latest'
-        run: ${{ matrix.setup_vlc }}
+      # ============================================================
+      # LINUX: Установка, подготовка либ, сборка, загрузка
+      # ============================================================
+      - name: [Linux] Install VLC & Prepare Libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y vlc
+          mkdir -p vlc_libs/plugins
+          
+          # Жесткое копирование конкретных версий Ubuntu 22.04/24.04 + переименование в unversioned names
+          cp /usr/lib/x86_64-linux-gnu/libvlc.so.5        vlc_libs/libvlc.so
+          cp /usr/lib/x86_64-linux-gnu/libvlccore.so.9     vlc_libs/libvlccore.so
+          
+          # Копируем плагины рекурсивно
+          cp -r /usr/lib/x86_64-linux-gnu/vlc/plugins/*    vlc_libs/plugins/
+          
+          ls -la vlc_libs/
+          ls -la vlc_libs/plugins/ | head -5
+
+      - name: [Linux] Install Python Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt5 pyinstaller python-vlc
+
+      - name: [Linux] Build Executable (PyInstaller)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller \
+            --onefile \
+            --clean \
+            --name=vlc-player-linux \
+            --distpath=dist \
+            --workpath=build \
+            --noconfirm \
+            --strip \
+            --noupx \
+            --console \
+            --add-binary="vlc_libs/libvlc.so:vlc_libs" \
+            --add-binary="vlc_libs/libvlccore.so:vlc_libs" \
+            --add-data="vlc_libs/plugins:vlc_libs/plugins" \
+            main.py
+
+      - name: [Linux] Upload Artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlc-player-linux-${{ github.sha }}${{ github.event.inputs.version_suffix }}
+          path: dist/vlc-player-linux
+          retention-days: 30
+          if-no-files-found: error
+
+      # ============================================================
+      # WINDOWS: Скачивание, распаковка, подготовка, сборка, загрузка
+      # ============================================================
+      - name: [Windows] Download & Prepare VLC Libs
+        if: runner.os == 'Windows'
         shell: pwsh
+        run: |
+          $VLC_VERSION = "3.0.21"
+          $ZIP_URL = "https://get.videolan.org/vlc/$VLC_VERSION/win64/vlc-$VLC_VERSION-win64.zip"
+          Write-Host "Downloading $ZIP_URL ..."
+          Invoke-WebRequest -Uri $ZIP_URL -OutFile "vlc.zip" -UseBasicParsing
+          
+          # Распаковка в ЖЕСТКУЮ папку vlc_extracted
+          7z x vlc.zip -ovlc_extracted > nul
+          
+          # Путь внутри архива: vlc_extracted\vlc-3.0.21\
+          $SRC = "vlc_extracted\vlc-$VLC_VERSION"
+          
+          mkdir vlc_libs\plugins -Force
+          Copy-Item "$SRC\libvlc.dll"        vlc_libs\
+          Copy-Item "$SRC\libvlccore.dll"    vlc_libs\
+          Copy-Item "$SRC\plugins\*"         vlc_libs\plugins\ -Recurse -Force
+          
+          Write-Host "VLC libs prepared:"
+          ls vlc_libs\
+          ls vlc_libs\plugins\ | Select-Object -First 5
 
-      # --- ШАГ 2: Подготовка VLC для Linux / macOS (Bash) ---
-      - name: Prepare VLC Libraries (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        run: ${{ matrix.setup_vlc }}
-        shell: bash
-
-      - name: Install Python Dependencies
+      - name: [Windows] Install Python Dependencies
+        if: runner.os == 'Windows'
         run: |
           python -m pip install --upgrade pip
           pip install PyQt5 pyinstaller python-vlc
         shell: bash
 
-      - name: Build Monolithic Executable (PyInstaller)
-        # Формируем команду PyInstaller прямо здесь, подставляя сепаратор matrix.sep
-        # --add-binary "SRC${sep}DEST" --add-data "SRC${sep}DEST"
-        env:
-          SEP: ${{ matrix.sep }}
-          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+      - name: [Windows] Build Executable (PyInstaller)
+        if: runner.os == 'Windows'
         run: |
-          # Базовые аргументы
-          ARGS=(
-            "main.py"
-            "--name=$ARTIFACT_NAME"
-            "--onefile"
-            "--clean"
-            "--distpath=dist"
-            "--workpath=build"
-            "--noconfirm"
-            "--strip"
-            "--noupx"
-          )
+          pyinstaller ^
+            --onefile ^
+            --clean ^
+            --name=vlc-player-windows ^
+            --distpath=dist ^
+            --workpath=build ^
+            --noconfirm ^
+            --strip ^
+            --noupx ^
+            --noconsole ^
+            --add-binary="vlc_libs/libvlc.dll;vlc_libs" ^
+            --add-binary="vlc_libs/libvlccore.dll;vlc_libs" ^
+            --add-data="vlc_libs/plugins;vlc_libs/plugins" ^
+            main.py
+        shell: cmd
 
-          # GUI режим (нет консоли) на Win/macOS
-          if [[ "$RUNNER_OS" == "Windows" || "$RUNNER_OS" == "macOS" ]]; then
-            ARGS+=("--noconsole")
-          else
-            ARGS+=("--console")
-          fi
-
-          # Добавляем бинарники VLC (ядро)
-          # Linux: libvlc.so* (включает симлинк и версионированные файлы)
-          # Windows: libvlc.dll
-          # macOS: libvlc.dylib
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            ARGS+=("--add-binary=vlc_libs/libvlc.so*:vlc_libs")
-            ARGS+=("--add-binary=vlc_libs/libvlccore.so*:vlc_libs")
-          elif [[ "$RUNNER_OS" == "Windows" ]]; then
-            ARGS+=("--add-binary=vlc_libs/libvlc.dll;vlc_libs")
-            ARGS+=("--add-binary=vlc_libs/libvlccore.dll;vlc_libs")
-          else # macOS
-            ARGS+=("--add-binary=vlc_libs/libvlc.dylib:vlc_libs")
-            ARGS+=("--add-binary=vlc_libs/libvlccore.dylib:vlc_libs")
-          fi
-
-          # Добавляем плагины (папку) через --add-data
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            ARGS+=("--add-data=vlc_libs/plugins;vlc_libs/plugins")
-          else
-            ARGS+=("--add-data=vlc_libs/plugins:vlc_libs/plugins")
-          fi
-
-          echo "Running PyInstaller with args:"
-          printf '  %s\n' "${ARGS[@]}"
-          
-          python -m PyInstaller "${ARGS[@]}"
-        shell: bash
-
-      - name: Upload Artifact
+      - name: [Windows] Upload Artifact
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ github.sha }}${{ github.event.inputs.version_suffix }}
-          path: dist/${{ matrix.artifact_name }}${{ matrix.ext }}
+          name: vlc-player-windows-${{ github.sha }}${{ github.event.inputs.version_suffix }}
+          path: dist/vlc-player-windows.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      # ============================================================
+      # MACOS: Установка (brew), подготовка с фоллбеками, сборка, загрузка
+      # ============================================================
+      - name: [macOS] Install VLC & Prepare Libs
+        if: runner.os == 'macOS'
+        run: |
+          brew install vlc
+          
+          mkdir -p vlc_libs/plugins
+          
+          # Фоллбек пути для Apple Silicon (opt) и Intel (usr/local)
+          VLC_PATHS=(
+            "/opt/homebrew/opt/vlc/lib"
+            "/usr/local/opt/vlc/lib"
+          )
+          
+          FOUND=""
+          for P in "${VLC_PATHS[@]}"; do
+            if [ -f "$P/libvlc.dylib" ] && [ -d "$P/vlc/plugins" ]; then
+              FOUND="$P"
+              break
+            fi
+          done
+          
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: VLC libs not found in known Homebrew paths."
+            ls -la /opt/homebrew/opt/vlc/lib 2>/dev/null || true
+            ls -la /usr/local/opt/vlc/lib 2>/dev/null || true
+            exit 1
+          fi
+          
+          echo "Using VLC prefix: $FOUND"
+          
+          cp "$FOUND/libvlc.dylib"      vlc_libs/
+          cp "$FOUND/libvlccore.dylib"  vlc_libs/
+          cp -r "$FOUND/vlc/plugins/"*  vlc_libs/plugins/
+          
+          ls -la vlc_libs/
+          ls -la vlc_libs/plugins/ | head -5
+
+      - name: [macOS] Install Python Dependencies
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt5 pyinstaller python-vlc
+
+      - name: [macOS] Build Executable (PyInstaller)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller \
+            --onefile \
+            --clean \
+            --name=vlc-player-macos \
+            --distpath=dist \
+            --workpath=build \
+            --noconfirm \
+            --strip \
+            --noupx \
+            --noconsole \
+            --add-binary="vlc_libs/libvlc.dylib:vlc_libs" \
+            --add-binary="vlc_libs/libvlccore.dylib:vlc_libs" \
+            --add-data="vlc_libs/plugins:vlc_libs/plugins" \
+            main.py
+
+      - name: [macOS] Upload Artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlc-player-macos-${{ github.sha }}${{ github.event.inputs.version_suffix }}
+          path: dist/vlc-player-macos
           retention-days: 30
           if-no-files-found: error
