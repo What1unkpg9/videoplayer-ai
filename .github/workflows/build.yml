@@ -87,9 +87,17 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Prepare VLC Libraries (OS Specific)
+      # --- ШАГ 1: Подготовка VLC для Windows (PowerShell) ---
+      - name: Prepare VLC Libraries (Windows)
+        if: matrix.os == 'windows-latest'
         run: ${{ matrix.setup_vlc }}
-        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
+        shell: pwsh
+
+      # --- ШАГ 2: Подготовка VLC для Linux / macOS (Bash) ---
+      - name: Prepare VLC Libraries (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: ${{ matrix.setup_vlc }}
+        shell: bash
 
       - name: Install Python Dependencies
         run: |
@@ -139,7 +147,7 @@ jobs:
             ARGS+=("--add-binary=vlc_libs/libvlccore.dylib:vlc_libs")
           fi
 
-          # Добавляем плагины (папка) через --add-data
+          # Добавляем плагины (папку) через --add-data
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             ARGS+=("--add-data=vlc_libs/plugins;vlc_libs/plugins")
           else
