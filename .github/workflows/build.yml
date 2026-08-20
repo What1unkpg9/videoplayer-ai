@@ -4,8 +4,8 @@ name: Build Portable Executable (Manual)
 on:
   workflow_dispatch:
     inputs:
-      upload_name_suffix:
-        description: 'Suffix for artifact name (e.g. v1.0-beta)'
+      upload_suffix:
+        description: 'Optional suffix for artifact name (e.g. v1.0.0)'
         required: false
         default: ''
 
@@ -20,19 +20,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: ставим vlc и dev пакеты (чтобы были headers/libs для python-vlc при импорте в build.py)
           - os: ubuntu-latest
             artifact_name: vlc-player-linux
+            # Ubuntu: vlc (либы и плагины), libvlc-dev (хэдеры для python-vlc при импорте в build.py), python3-dev
             install_cmd: sudo apt-get update && sudo apt-get install -y vlc libvlc-dev python3-dev
             ext: ""
-          # Windows: ставим VLC через chocolatey
           - os: windows-latest
             artifact_name: vlc-player-windows
+            # Windows: VLC через Chocolatey. Версия 3.0.21 стабильна.
             install_cmd: choco install vlc --version=3.0.21 -y
             ext: ".exe"
-          # macOS: ставим VLC через brew
           - os: macos-latest
             artifact_name: vlc-player-macos
+            # macOS: VLC через Homebrew. Ставит формулу (keg-only) в /usr/local/opt/vlc или /opt/homebrew/opt/vlc
             install_cmd: brew install vlc
             ext: ""
 
@@ -62,7 +62,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ github.sha }}${{ github.event.inputs.upload_name_suffix }}
+          name: ${{ matrix.artifact_name }}-${{ github.sha }}${{ github.event.inputs.upload_suffix }}
           path: dist_portable/${{ matrix.artifact_name }}${{ matrix.ext }}
           retention-days: 30
           if-no-files-found: error
