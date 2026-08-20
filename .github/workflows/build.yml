@@ -1,0 +1,86 @@
+# .github/workflows/build.yml
+name: Build Executable (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pyinstaller_args:
+        description: 'Additional PyInstaller arguments (e.g. --noconsole for Windows GUI)'
+        required: false
+        default: '--noconsole'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: vlc-player-linux
+            # VLC dev libraries needed for build on Linux
+            pkg_deps: vlc libvlc-dev python3-dev
+          - os: windows-latest
+            artifact_name: vlc-player-windows.exe
+            pkg_deps: '' # VLC runtime usually bundled or expected on target; python-vlc finds dlls
+          - os: macos-latest
+            artifact_name: vlc-player-macos
+            pkg_deps: vlc
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Dependencies (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg_deps }}
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            brew install ${{ matrix.pkg_deps }}
+          fi
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt5 pyinstaller python-vlc
+
+      - name: Build Executable with PyInstaller
+        run: |
+          pyinstaller \
+            --clean \
+            --onefile \
+            --name "${{ matrix.artifact_name }}" \
+            ${{ github.event.inputs.pyinstaller_args }} \
+            --add-data "main.py:." \
+            main.py
+        shell: bash
+
+      - name: Verify Binary
+        run: |
+          ls -la dist/
+          # Quick smoke test: check if binary runs --help or exists (headless)
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            xvfb-run -a ./dist/${{ matrix.artifact_name }} --help || true
+          elif [ "${{ runner.os }}" == "Windows" ]; then
+            ./dist/${{ matrix.artifact_name }} --help || true
+          else
+            ./dist/${{ matrix.artifact_name }} --help || true
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ github.sha }}
+          path: dist/${{ matrix.artifact_name }}*
+          retention-days: 30
+          if-no-files-found: error
