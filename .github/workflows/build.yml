@@ -1,13 +1,13 @@
 # .github/workflows/build.yml
-name: Build Executable (Manual)
+name: Build Portable Executable (Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      pyinstaller_args:
-        description: 'Additional PyInstaller arguments (e.g. --noconsole for Windows GUI)'
+      upload_name_suffix:
+        description: 'Suffix for artifact name (e.g. v1.0-beta)'
         required: false
-        default: '--noconsole'
+        default: ''
 
 permissions:
   contents: read
@@ -17,18 +17,24 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Linux: ставим vlc и dev пакеты (чтобы были headers/libs для python-vlc при импорте в build.py)
           - os: ubuntu-latest
             artifact_name: vlc-player-linux
-            # VLC dev libraries needed for build on Linux
-            pkg_deps: vlc libvlc-dev python3-dev
+            install_cmd: sudo apt-get update && sudo apt-get install -y vlc libvlc-dev python3-dev
+            ext: ""
+          # Windows: ставим VLC через chocolatey
           - os: windows-latest
-            artifact_name: vlc-player-windows.exe
-            pkg_deps: '' # VLC runtime usually bundled or expected on target; python-vlc finds dlls
+            artifact_name: vlc-player-windows
+            install_cmd: choco install vlc --version=3.0.21 -y
+            ext: ".exe"
+          # macOS: ставим VLC через brew
           - os: macos-latest
             artifact_name: vlc-player-macos
-            pkg_deps: vlc
+            install_cmd: brew install vlc
+            ext: ""
 
     steps:
       - name: Checkout Repository
@@ -39,48 +45,24 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          if [ "${{ runner.os }}" == "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg_deps }}
-          elif [ "${{ runner.os }}" == "macOS" ]; then
-            brew install ${{ matrix.pkg_deps }}
-          fi
+      - name: Install System Dependencies (VLC + Build Tools)
+        run: ${{ matrix.install_cmd }}
+        shell: bash
 
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install PyQt5 pyinstaller python-vlc
-
-      - name: Build Executable with PyInstaller
-        run: |
-          pyinstaller \
-            --clean \
-            --onefile \
-            --name "${{ matrix.artifact_name }}" \
-            ${{ github.event.inputs.pyinstaller_args }} \
-            --add-data "main.py:." \
-            main.py
         shell: bash
 
-      - name: Verify Binary
+      - name: Build Portable Executable
+        run: python build.py
         shell: bash
-        run: |
-          ls -la dist/
-          # Quick smoke test: check if binary runs --help or exists (headless)
-          if [ "${{ runner.os }}" == "Linux" ]; then
-            xvfb-run -a ./dist/${{ matrix.artifact_name }} --help || true
-          elif [ "${{ runner.os }}" == "Windows" ]; then
-            ./dist/${{ matrix.artifact_name }} --help || true
-          else
-            ./dist/${{ matrix.artifact_name }} --help || true
-          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ github.sha }}
-          path: dist/${{ matrix.artifact_name }}*
+          name: ${{ matrix.artifact_name }}-${{ github.sha }}${{ github.event.inputs.upload_name_suffix }}
+          path: dist_portable/${{ matrix.artifact_name }}${{ matrix.ext }}
           retention-days: 30
           if-no-files-found: error
