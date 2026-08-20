@@ -65,6 +65,7 @@ jobs:
         shell: bash
 
       - name: Verify Binary
+        shell: bash
         run: |
           ls -la dist/
           # Quick smoke test: check if binary runs --help or exists (headless)
